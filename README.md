@@ -4,12 +4,25 @@ Deploys an Azure Firewall environment using [Azure Verified Modules (AVM)](https
 
 ## Architecture
 
+This deployment implements a **Hub-and-Spoke** topology:
+
+**Hub VNet**
 - **Resource Group** — AVM resource group module
 - **Log Analytics Workspace** — centralized diagnostics destination
-- **Virtual Network** — AVM VNet with dedicated `AzureFirewallSubnet`
+- **Virtual Network** — AVM Hub VNet with dedicated `AzureFirewallSubnet`
 - **Public IP** — Standard SKU, zone-redundant
 - **Firewall Policy** — manages rule collections
 - **Azure Firewall** — Standard/Premium tier with diagnostics enabled
+
+**Spoke VNet**
+- **Spoke Virtual Network** — AVM VNet peered to Hub via bidirectional VNet peering
+- **Workload Subnet** — subnet with UDR forcing all egress traffic through the firewall
+- **Route Table** — default route (`0.0.0.0/0`) pointing to Firewall private IP
+- **NAT Gateway** — outbound connectivity for spoke workloads
+
+**Firewall Rules**
+- **Network Rule Collections** — L4 rules (DNS, NTP, custom)
+- **Application Rule Collections** — L7 FQDN-based rules (web, updates)
 
 ## Project Structure
 
@@ -20,10 +33,14 @@ Deploys an Azure Firewall environment using [Azure Verified Modules (AVM)](https
 ├── locals.tf                           # Naming computation and diagnostic settings
 ├── main.tf                             # Random string and resource group
 ├── avm.log_analytics_workspace.tf      # Log Analytics Workspace AVM module
-├── avm.virtual_network.tf              # Virtual Network AVM module
-├── avm.public_ip_address.tf            # Public IP AVM module
+├── avm.virtual_network.tf              # Hub Virtual Network AVM module
+├── avm.public_ip_address.tf            # Firewall Public IP AVM module
 ├── avm.firewall_policy.tf              # Firewall Policy AVM module
 ├── avm.firewall.tf                     # Azure Firewall AVM module
+├── avm.nat_gateway.tf                  # NAT Gateway AVM module (spoke outbound)
+├── avm.spoke_virtual_network.tf        # Spoke Virtual Network AVM module
+├── spoke_route_table.tf                # UDR routing spoke traffic via firewall
+├── firewall_rules.tf                   # Network & application rule collections
 ├── outputs.tf                          # Grouped output maps
 ├── terraform.tfvars.example            # Example variable values
 └── README.md
@@ -59,6 +76,7 @@ Override any name template via the `resource_name_templates` variable.
 | [Firewall Policy](https://registry.terraform.io/modules/Azure/avm-res-network-firewallpolicy/azurerm/latest) | 0.2.3 |
 | [Azure Firewall](https://registry.terraform.io/modules/Azure/avm-res-network-azurefirewall/azurerm/latest) | 0.4.0 |
 | [Regions Utility](https://registry.terraform.io/modules/Azure/avm-utl-regions/azurerm/latest) | 0.5.0 |
+| [NAT Gateway](https://registry.terraform.io/modules/Azure/avm-res-network-natgateway/azurerm/latest) | 0.3.2 |
 
 ## Quick Start
 
@@ -69,13 +87,8 @@ cp terraform.tfvars.example terraform.tfvars
 terraform init
 terraform plan
 terraform apply
+terraform output
 ```
-
-7. **View outputs**
-
-   ```bash
-   terraform output
-   ```
 
 ## Configuration
 
@@ -208,7 +221,7 @@ To extend this configuration:
 
 ## License
 
-This configuration uses Azure Verified Modules which follow Microsoft's standard licensing.
+This project is licensed under the [MIT License](LICENSE). Azure Verified Modules (AVM) used in this project follow their respective licenses as published by Microsoft.
 
 ## References
 
@@ -217,3 +230,64 @@ This configuration uses Azure Verified Modules which follow Microsoft's standard
 - [Terraform Azure Provider](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs)
 - [Azure Verified Modules](https://aka.ms/avm)
 - [Terraform Style Guide](https://developer.hashicorp.com/terraform/language/style)
+
+
+
+## Architecture
+
+```mermaid
+flowchart TD
+    Internet(["Internet"])
+
+    subgraph Global["GLOBAL"]
+        AFD["Azure Front Door Standard\nafd-fw-dev-001\nep-afd-fw-dev-001.azurefd.net"]
+    end
+
+    subgraph Spoke["SPOKE VNet  10.1.0.0/16"]
+        subgraph snet_appgw["snet-appgw  10.1.2.0/24"]
+            PIP_AppGW["Public IP\npip-agw-fw-dev-eastus-001"]
+            AppGW["Application Gateway WAF_v2\nagw-fw-dev-eastus-001\nOWASP 3.2 / Detection mode"]
+        end
+        subgraph snet_workload["snet-workload  10.1.1.0/24"]
+            VM["Workload VMs / Apps\nUDR: 0.0.0.0/0 to Firewall"]
+        end
+    end
+
+    subgraph Hub["HUB VNet  10.0.0.0/16"]
+        subgraph snet_fw["AzureFirewallSubnet  10.0.1.0/26"]
+            FW["Azure Firewall Standard\nfw-fw-dev-eastus-001\nPrivate IP: 10.0.1.4"]
+            PIP_FW["Firewall Public IP\npip-fw-fw-dev-eastus-001"]
+            NAT["NAT Gateway\nnat-fw-dev-eastus-001"]
+        end
+        LAW["Log Analytics Workspace\nlaw-fw-dev-eastus-001"]
+    end
+
+    %% Inbound traffic path
+    Internet -->|"HTTPS / HTTP"| AFD
+    AFD -->|"HTTP origin"| PIP_AppGW
+    PIP_AppGW --> AppGW
+    AppGW -->|"Layer 7 routing"| VM
+
+    %% Outbound via firewall
+    VM -->|"UDR default route"| FW
+    FW --> NAT
+    NAT -->|"SNAT outbound"| Internet
+
+    %% VNet peering
+    Spoke <--> Hub
+
+    %% Diagnostics
+    FW -.->|"diag logs"| LAW
+    AppGW -.->|"diag logs"| LAW
+    PIP_FW -.->|"diag logs"| LAW
+
+    classDef globalStyle fill:#0072c6,color:#fff,stroke:#004e8c
+    classDef spokeStyle  fill:#107c10,color:#fff,stroke:#0a5c0a
+    classDef hubStyle    fill:#d83b01,color:#fff,stroke:#a62d01
+    classDef monStyle    fill:#605e5c,color:#fff,stroke:#3b3a39
+
+    class AFD globalStyle
+    class AppGW,PIP_AppGW,VM spokeStyle
+    class FW,PIP_FW,NAT hubStyle
+    class LAW monStyle
+```
